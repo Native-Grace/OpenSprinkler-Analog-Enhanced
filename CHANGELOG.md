@@ -6,6 +6,23 @@ Versions: `<FW_VERSION>.<FW_MINOR>` — e.g. `2.4.0 (187)` means `OS_FW_VERSION=
 
 ---
 
+## [Analog-Enhanced on 2.4.0(221)] — 2026-07-22
+
+### Added
+- Unified `sensor_validate_config()` with explicit error codes for divider, interval, port, Modbus id, ADS channel, type, duplicates.
+- `fromConfigJson` / `toConfigJson` / `toStatusJson` separation; host unit tests under `tests/unit`.
+- Enhanced-fork documentation (`docs/UPSTREAM.md`, `REVIEW.md`, `ROADMAP.md`, hardware test plan, building/testing guides).
+
+### Fixed
+- Modbus: null-check `modbus_new_*`; do not call RTU setters on TCP contexts; continue loading other adapters on failure.
+- Sensor replace/load: transactional type changes; duplicate `nr` skipped without leak; runtime JSON fields ignored on config apply.
+- Timing: wrap-safe elapsed comparisons; retry no longer doubles interval; trend accepts exactly one-hour span; non-finite samples reset trend.
+- ADS1115: require register behaviour (no ESP8266 ACK-only fallback); save/restore Lo_thresh during probe.
+- Flow pulse: wrap-safe delta with implausible-jump reset detection.
+- String copies for sensor name / unit always NUL-terminated.
+
+---
+
 ## [2.4.0(220)] — veröffentlicht 2026-07-19
 
 ### Added

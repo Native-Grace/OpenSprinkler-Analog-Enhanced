@@ -1,0 +1,18 @@
+id,title,severity,status,area,notes
+M1,Null-check modbus_new_tcp/rtu,P0,fixed,modbus,sensors.cpp sensor_api_init
+M2,Do not call RTU setters on TCP contexts,P0,fixed,modbus,sensors.cpp
+S1,Reject divider zero,P0,fixed,sensors,validation
+S2,Unified config validation,P0,fixed,sensors,sensor_validation
+S3,Duplicate sensor nr handling,P0,fixed,sensors,load + define
+S4,Transactional sensor replace,P0,fixed,sensors,sensor_define
+S5,Ignore runtime fields in config JSON,P0,fixed,sensors,fromConfigJson
+T1,Rollover-safe elapsed comparisons,P0,fixed,timing,sensor poll
+T2,Fix retry interval doubling,P0,fixed,timing,last_read scheduling
+T3,Trend exactly-one-hour span,P1,fixed,timing,SensorBase trend
+A1,ADS1115 not ACK-only on ESP8266,P1,fixed,analog,is_ads1115
+A2,Restore ADS1115 Lo_thresh after probe,P1,fixed,analog,scratch test
+STR1,Null-terminate fixed string copies,P1,fixed,strings,safe_strncpy
+P1,Pulse counter rollover classification,P2,partial,sensors,needs HIL
+H1,TCP create fail vs HAT RTS,P2,unconfirmed,modbus,hardware
+H2,ASB dual-ADS false positives,P2,unconfirmed,analog,hardware
+H3,NTP step-back during poll,P2,unconfirmed,timing,hardware

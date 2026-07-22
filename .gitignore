@@ -25,7 +25,16 @@ node_modules
 .DS_Store
 matter_mfg/
 docs
+!docs/UPSTREAM.md
+!docs/REVIEW.md
+!docs/ROADMAP.md
+!docs/ARCHITECTURE.md
+!docs/SENSOR_CONFIGURATION.md
+!docs/BUILDING.md
+!docs/TESTING.md
+!docs/HARDWARE_TEST_PLAN.md
 *.pem
 .rainmaker-env/
 .env
 !.env.example
+tests/unit/test_sensor_safety
