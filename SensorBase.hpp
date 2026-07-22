@@ -124,17 +124,22 @@ public:
 
   void trend_add_sample(double value, uint32_t sample_time) {
     if (!isfinite(value) || sample_time == 0) {
-      trend_state = TREND_UNAVAILABLE;
+      trend_reset();
       return;
     }
 
     // Rate-limit: ensure samples are spaced far enough apart so the
     // ring buffer can span at least TREND_MIN_SPAN_SEC when full.
     // Min interval = 3600 / 24 = 150 seconds.
+    // Use wrap-safe elapsed comparison; reset on large backward time steps.
     if (trend_count > 0) {
       uint8_t last_idx = (uint8_t)((trend_head + TREND_HISTORY_SIZE - 1) % TREND_HISTORY_SIZE);
       uint32_t min_interval = TREND_MIN_SPAN_SEC / TREND_HISTORY_SIZE;
-      if (sample_time < trend_time[last_idx] + min_interval) {
+      uint32_t last_t = trend_time[last_idx];
+      if (sample_time < last_t) {
+        // Clock moved backwards — drop history rather than corrupt the window.
+        trend_reset();
+      } else if ((uint32_t)(sample_time - last_t) < min_interval) {
         return;  // Too soon — skip to protect the time window
       }
     }
@@ -155,7 +160,8 @@ public:
     uint8_t newest_idx = (uint8_t)((trend_head + TREND_HISTORY_SIZE - 1) % TREND_HISTORY_SIZE);
     uint32_t t_oldest = trend_time[oldest_idx];
     uint32_t t_newest = trend_time[newest_idx];
-    if (t_newest <= t_oldest + TREND_MIN_SPAN_SEC) {
+    // Exactly one hour must satisfy "at least one hour" (rollover-safe).
+    if ((uint32_t)(t_newest - t_oldest) < TREND_MIN_SPAN_SEC) {
       trend_state = TREND_UNAVAILABLE;
       return;
     }
@@ -207,10 +213,9 @@ public:
 #endif // !defined(ESP8266)
 
   /**
-   * @brief Serialize sensor configuration to JSON object
-   * @param obj JSON object to populate
+   * @brief Serialize sensor configuration only (no runtime fields)
    */
-  virtual void toJson(ArduinoJson::JsonObject obj) const {
+  virtual void toConfigJson(ArduinoJson::JsonObject obj) const {
     if (!obj) return;
     obj[F("nr")] = nr;
     obj[F("type")] = type;
@@ -224,34 +229,57 @@ public:
     obj[F("div")] = divider;
     obj[F("offset")] = offset_mv;
     obj[F("offset2")] = offset2;
-    obj[F("unit")] = getUnit();  // Use virtual method to get correct unit label
-    obj[F("unitid")] = getUnitId();  // Use virtual method for consistency
+    obj[F("unit")] = getUnit();
+    obj[F("unitid")] = getUnitId();
     obj[F("enable")] = (uint)flags.enable;
     obj[F("log")] = (uint)flags.log;
     obj[F("stdlog")] = (uint)stdlog;
     obj[F("show")] = (uint)flags.show;
+  }
 
-    // runtime fields
+  /**
+   * @brief Serialize configuration plus runtime status fields
+   */
+  virtual void toStatusJson(ArduinoJson::JsonObject obj) const {
+    toConfigJson(obj);
+    if (!obj) return;
     obj[F("data_ok")] = (uint)flags.data_ok;
     obj[F("last")] = last;
     obj[F("nativedata")] = last_native_data;
-    obj[F("data")] = last_data;
+    // Never serialize non-finite samples into API/status JSON.
+    if (isfinite(last_data)) {
+      obj[F("data")] = last_data;
+    } else {
+      obj[F("data")] = nullptr;
+    }
 #if !defined(ESP8266)
     obj[F("trend")] = trend_state;
 #endif
   }
 
   /**
-   * @brief Load sensor configuration from JSON object
-   * @param obj JSON object with configuration data
+   * @brief Serialize sensor configuration to JSON object
+   * @note Compatibility wrapper: emits status-style payload (config + runtime).
+   *       Persistence paths should prefer toConfigJson().
    */
-  virtual void fromJson(ArduinoJson::JsonVariantConst obj) {
+  virtual void toJson(ArduinoJson::JsonObject obj) const {
+    toStatusJson(obj);
+  }
+
+  /**
+   * @brief Apply configuration fields from JSON; ignore runtime-only keys.
+   */
+  virtual void fromConfigJson(ArduinoJson::JsonVariantConst obj) {
     if (obj.containsKey(F("nr"))) nr = obj[F("nr")];
     if (obj.containsKey(F("type"))) type = obj[F("type")];
     if (obj.containsKey(F("group"))) group = obj[F("group")];
     if (obj.containsKey(F("name"))) {
       const char *sname = obj[F("name")].as<const char*>();
-      if (sname) strncpy(name, sname, sizeof(name)-1);
+      if (sname) {
+        size_t i = 0;
+        for (; i + 1 < sizeof(name) && sname[i] != '\0'; i++) name[i] = sname[i];
+        name[i] = '\0';
+      }
     }
     if (obj.containsKey(F("ip"))) ip = obj[F("ip")];
     if (obj.containsKey(F("port"))) port = obj[F("port")];
@@ -265,18 +293,26 @@ public:
     if (obj.containsKey(F("offset2"))) offset2 = obj[F("offset2")];
     if (obj.containsKey(F("unit"))) {
       const char *unit = obj[F("unit")].as<const char*>();
-      if (unit) strncpy(userdef_unit, unit, sizeof(userdef_unit)-1);
+      if (unit) {
+        size_t i = 0;
+        for (; i + 1 < sizeof(userdef_unit) && unit[i] != '\0'; i++) userdef_unit[i] = unit[i];
+        userdef_unit[i] = '\0';
+      }
     }
     if (obj.containsKey(F("unitid"))) assigned_unitid = obj[F("unitid")];
     if (obj.containsKey(F("enable"))) flags.enable = obj[F("enable")];
     if (obj.containsKey(F("log"))) flags.log = obj[F("log")];
     if (obj.containsKey(F("stdlog"))) stdlog = obj[F("stdlog")];
     if (obj.containsKey(F("show"))) flags.show = obj[F("show")];
+    // Intentionally ignore runtime-only fields: data_ok, last, nativedata, data, trend, …
+  }
 
-    if (obj.containsKey(F("data_ok"))) flags.data_ok = obj[F("data_ok")];
-    if (obj.containsKey(F("last"))) last = obj[F("last")];
-    if (obj.containsKey(F("nativedata"))) last_native_data = obj[F("nativedata")];
-    if (obj.containsKey(F("data"))) last_data = obj[F("data")];
+  /**
+   * @brief Load sensor configuration from JSON object
+   * @note Compatibility wrapper: applies config fields only (runtime keys ignored).
+   */
+  virtual void fromJson(ArduinoJson::JsonVariantConst obj) {
+    fromConfigJson(obj);
   }
 };
 

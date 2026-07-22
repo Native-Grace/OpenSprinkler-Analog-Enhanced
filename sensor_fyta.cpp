@@ -242,7 +242,8 @@ void FytaApi::init() {
 int FytaSensor::read(unsigned long time) {
     SensorBase *data_ = this;
     if (!data_) return HTTP_RQT_NOT_RECEIVED;
-    if (time >= data_->last_read + data_->read_interval) {
+    if (data_->last_read == 0 ||
+        (uint32_t)(time - data_->last_read) >= (uint32_t)data_->read_interval) {
         data_->last_read = time;
 
         FytaApi fytaapi(os.sopt_load(SOPT_FYTA_OPTS));

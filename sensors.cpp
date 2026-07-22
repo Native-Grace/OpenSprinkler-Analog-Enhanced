@@ -23,6 +23,10 @@
 #include "sensors.h"
 #include "SensorBase.hpp"
 #include "sensors_util.h"
+#include "sensor_validation.h"
+#include "timing_utils.h"
+#include "safe_string.h"
+#include "modbus_context.h"
 #include "main.h"
 #include "TimeLib.h"
 #include <new>
@@ -209,14 +213,31 @@ public:
   virtual int read(unsigned long time) override {
     (void)time;
     uint32_t current_count = (uint32_t)flow_count;
-    if (last_read == 0 || current_count < last_native_data) {
+
+    // First sample after boot / enable: establish baseline without inventing usage.
+    if (last_read == 0) {
       last_native_data = current_count;
       last_data = 0;
       flags.data_ok = 1;
       return HTTP_RQT_SUCCESS;
     }
 
-    uint32_t delta = current_count - last_native_data;
+    // Unsigned wrap-safe delta handles natural uint32 rollover.
+    uint32_t delta = timing_counter_delta_u32(current_count, (uint32_t)last_native_data);
+
+    // Distinguish implausible jumps (sensor reset / controller-side counter clear)
+    // from natural rollover. Cap by a generous pulses-per-interval ceiling.
+    const uint32_t MAX_PLAUSIBLE_PULSES = 1000000u;
+    if (delta > MAX_PLAUSIBLE_PULSES) {
+      DEBUG_PRINTF("[FLOW] Implausible pulse jump #%u: prev=%lu cur=%lu delta=%lu — treating as reset\n",
+                   nr, (unsigned long)last_native_data, (unsigned long)current_count,
+                   (unsigned long)delta);
+      last_native_data = current_count;
+      last_data = 0;
+      flags.data_ok = 1;
+      return HTTP_RQT_SUCCESS;
+    }
+
     last_native_data = current_count;
     last_data = (double)delta * flow_pulse_volume();
     flags.data_ok = 1;
@@ -248,7 +269,9 @@ static void sensor_standard_waterlog_add(SensorBase *sensor, ulong time) {
     sensor->last_stdlog_data = sensor->last_data;
   }
 
-  ulong duration = sensor->last_stdlog_time > 0 && time > sensor->last_stdlog_time ? time - sensor->last_stdlog_time : sensor->read_interval;
+  ulong duration = sensor->last_stdlog_time > 0
+      ? (ulong)timing_counter_delta_u32((uint32_t)time, (uint32_t)sensor->last_stdlog_time)
+      : sensor->read_interval;
   sensor->last_stdlog_time = time;
   if (volume <= 0) return;
   write_flow_log(volume, log_unitid, duration, time);
@@ -274,17 +297,37 @@ uint16_t CRC16(unsigned char buf[], int len) {
   return crc;
 }  // End: CRC16
 
+// ADS1115 detection result codes (clear states for callers / diagnostics)
+enum Ads1115DetectState {
+  ADS1115_DETECT_ABSENT = 0,
+  ADS1115_DETECT_PRESENT_UNKNOWN = 1,
+  ADS1115_DETECT_OK = 2,
+  ADS1115_DETECT_COMM_FAIL = 3
+};
+
 // ADS1115 Schreib/Rücklese-Test auf dem Lo_thresh-Register (0x02).
-// Lo_thresh ist ein reines 16-bit R/W-Register ohne Hardware-Seiteneffekte.
-// Gibt true zurück, wenn der Wert korrekt zurückgelesen wird.
+// Saves and restores the previous Lo_thresh value so probing does not leave
+// comparator thresholds altered. Returns ADS1115_DETECT_* state.
 #if defined(ESP8266) || defined(ESP32)
-static bool ads1115_scratch_test(int addr) {
+static int ads1115_scratch_test(int addr) {
   const uint16_t TEST_VAL = 0x5A5A;
+
+  // Read original Lo_thresh
+  Wire.beginTransmission(addr);
+  Wire.write(0x02);
+  if (Wire.endTransmission(false) != 0) return ADS1115_DETECT_COMM_FAIL;
+#if defined(ESP8266)
+  delay(1);
+#endif
+  Wire.requestFrom(addr, 2);
+  if (Wire.available() < 2) return ADS1115_DETECT_COMM_FAIL;
+  uint16_t original = ((uint16_t)Wire.read() << 8) | Wire.read();
+
   Wire.beginTransmission(addr);
   Wire.write(0x02);  // ADS1115 Lo_thresh-Register
   Wire.write((uint8_t)(TEST_VAL >> 8));
   Wire.write((uint8_t)(TEST_VAL & 0xFF));
-  if (Wire.endTransmission() != 0) return false;
+  if (Wire.endTransmission() != 0) return ADS1115_DETECT_COMM_FAIL;
 
 #if defined(ESP8266)
   // Software I2C on ESP8266 can need a short settle time before the register
@@ -301,9 +344,26 @@ static bool ads1115_scratch_test(int addr) {
 #endif
 
   Wire.requestFrom(addr, 2);
-  if (Wire.available() < 2) return false;
+  if (Wire.available() < 2) {
+    // Best-effort restore
+    Wire.beginTransmission(addr);
+    Wire.write(0x02);
+    Wire.write((uint8_t)(original >> 8));
+    Wire.write((uint8_t)(original & 0xFF));
+    Wire.endTransmission();
+    return ADS1115_DETECT_COMM_FAIL;
+  }
   uint16_t val = ((uint16_t)Wire.read() << 8) | Wire.read();
-  return (val == TEST_VAL);
+
+  // Restore original Lo_thresh regardless of match result
+  Wire.beginTransmission(addr);
+  Wire.write(0x02);
+  Wire.write((uint8_t)(original >> 8));
+  Wire.write((uint8_t)(original & 0xFF));
+  Wire.endTransmission();
+
+  if (val == TEST_VAL) return ADS1115_DETECT_OK;
+  return ADS1115_DETECT_PRESENT_UNKNOWN;
 }
 
 // SC16IS752 Scratch-Test über das SPR-Register (0x07) mit dem SC16IS752-typischen
@@ -326,17 +386,28 @@ static bool sc16is752_scratch_test_at(int addr) {
 }
 #endif
 
-// Prüft, ob auf addr ein ADS1115 sitzt:
-// Primär: positiver ADS1115-Scratch-Test.
-// Fallback: negativer SC16IS752-Scratch-Test (kein SC16IS752 → kein Fehlalarm).
+// Prüft, ob auf addr ein ADS1115 sitzt.
+// Do not identify ADS1115 from I²C ACK alone.
 static bool is_ads1115(int addr) {
-  if (ads1115_scratch_test(addr)) return true;
-#if defined(ESP8266)
-  // On ESP8266, the negative SC16 scratch probe can alias on some ADS1115 clones.
-  // Fall back to simple ACK detection to avoid false negatives.
-  return detect_i2c(addr);
+  if (!detect_i2c(addr)) return false;
+  int st = ads1115_scratch_test(addr);
+  if (st == ADS1115_DETECT_OK) return true;
+  if (st == ADS1115_DETECT_COMM_FAIL) {
+    DEBUG_PRINTF("[ASB] ADS1115 probe comm failure at 0x%02X\n", addr);
+    return false;
+  }
+#if defined(ESP32)
+  // Device ACKs but Lo_thresh probe did not match: distinguish SC16IS752.
+  if (sc16is752_scratch_test_at(addr)) {
+    DEBUG_PRINTF("[ASB] Address 0x%02X looks like SC16IS752, not ADS1115\n", addr);
+    return false;
+  }
+  DEBUG_PRINTF("[ASB] Address 0x%02X present but unrecognized as ADS1115\n", addr);
+  return false;
 #else
-  return !sc16is752_scratch_test_at(addr);
+  // ESP8266: require positive register behaviour — never fall back to ACK-only.
+  DEBUG_PRINTF("[ASB] Address 0x%02X present but ADS1115 scratch mismatch\n", addr);
+  return false;
 #endif
 }
 
@@ -482,9 +553,13 @@ void sensor_api_init(boolean detect_boards) {
     int n = 0;
     // DEBUG_PRINTLN(F("Opening USB RS485 Adapters:"));
     while (std::getline(file, tty)) {
-      modbus_t * ctx;
-      if (tty.find(".") > 0 || tty.find(":") > 0) {
-        if (tty.find(":") > 0) {
+      if (tty.empty()) continue;
+
+      const int transport = modbus_classify_endpoint(tty.c_str());
+      modbus_t *ctx = NULL;
+
+      if (transport == MODBUS_TRANSPORT_TCP) {
+        if (tty.find(':') != std::string::npos) {
           // IP:port
           std::string host = tty.substr(0, tty.find(':'));
           std::string port = tty.substr(tty.find(':') + 1);
@@ -493,20 +568,33 @@ void sensor_api_init(boolean detect_boards) {
           // IP only
           ctx = modbus_new_tcp(tty.c_str(), 502);
         }
-      }
-      else
+      } else if (transport == MODBUS_TRANSPORT_RTU) {
         ctx = modbus_new_rtu(tty.c_str(), 9600, 'E', 8, 1);
-      // DEBUG_PRINT(idx);
-      // DEBUG_PRINT(F(": "));
-      // DEBUG_PRINTLN(tty.c_str());
+      } else {
+        DEBUG_PRINT(F("[MODBUS] Skipping empty/invalid endpoint line\n"));
+        continue;
+      }
 
-      //unavailable on Raspi? modbus_enable_quirks(ctx, MODBUS_QUIRK_MAX_SLAVE);
-      modbus_rtu_set_serial_mode(ctx, MODBUS_RTU_RS485);
-      modbus_rtu_set_rts(ctx, MODBUS_RTU_RTS_NONE); // we use auto RTS function by the HAT
+      // Never call modbus_* with a null context (allocation / argument failure).
+      if (!ctx) {
+        DEBUG_PRINT(F("[MODBUS] Context creation failed for: "));
+        DEBUG_PRINTLN(tty.c_str());
+        idx++;
+        if (idx >= MAX_RS485_DEVICES) break;
+        continue;
+      }
+
+      // RTU-specific setup must not run on TCP contexts.
+      if (transport == MODBUS_TRANSPORT_RTU) {
+        //unavailable on Raspi? modbus_enable_quirks(ctx, MODBUS_QUIRK_MAX_SLAVE);
+        modbus_rtu_set_serial_mode(ctx, MODBUS_RTU_RS485);
+        modbus_rtu_set_rts(ctx, MODBUS_RTU_RTS_NONE); // we use auto RTS function by the HAT
+      }
+
       modbus_set_response_timeout(ctx, 1, 500000); // 1.5s
       if (modbus_connect(ctx) == -1) {
-        DEBUG_PRINT(F("Connection failed: "));
-        DEBUG_PRINTLN(modbus_strerror(errno));        
+        DEBUG_PRINT(F("[MODBUS] Connection failed: "));
+        DEBUG_PRINTLN(modbus_strerror(errno));
         modbus_free(ctx);
       } else {
         n++;
@@ -800,6 +888,63 @@ static inline void sensor_notify_zigbee(SensorBase *s) {
 #endif
 }
 
+static bool sensor_type_needs_modbus_addr(uint type) {
+  return (type >= RS485_SENSORS_START && type <= RS485_SENSORS_END) ||
+         type == SENSOR_MODBUS_RTU;
+}
+
+static bool sensor_type_needs_ads_channel(uint type) {
+  return (type >= ASB_SENSORS_START && type <= ASB_SENSORS_END) ||
+         (type >= OSPI_SENSORS_START && type <= OSPI_SENSORS_END &&
+          type != SENSOR_INTERNAL_TEMP);
+}
+
+static bool sensor_type_is_known(uint type) {
+  if (type == SENSOR_NONE) return false;
+  if (type >= RS485_SENSORS_START && type <= RS485_SENSORS_END) return true;
+  if (type >= ASB_SENSORS_START && type <= ASB_SENSORS_END) return true;
+  if (type >= OSPI_SENSORS_START && type <= OSPI_SENSORS_END) return true;
+  if (type == SENSOR_FYTA_MOISTURE || type == SENSOR_FYTA_TEMPERATURE) return true;
+  if (type == SENSOR_GARDENA_MOISTURE || type == SENSOR_GARDENA_TEMPERATURE) return true;
+  if (type == SENSOR_MQTT || type == SENSOR_REMOTE_JSON) return true;
+  if (type == SENSOR_ZIGBEE || type == SENSOR_BLE || type == SENSOR_FLOW_PULSE) return true;
+  if (type == SENSOR_REMOTE) return true;
+  if (type >= SENSOR_WEATHER_TEMP_F && type <= SENSOR_WEATHER_RADIATION) return true;
+  if (type >= SENSOR_GROUP_MIN && type <= SENSOR_GROUP_SUM) return true;
+  if (type == SENSOR_FREE_MEMORY || type == SENSOR_FREE_STORE) return true;
+  return false;
+}
+
+static int sensor_validate_object(const SensorBase *sensor, int check_duplicate_nr) {
+  if (!sensor) return SENSOR_VAL_ERR_NR;
+  SensorConfigView view = {};
+  view.nr = sensor->nr;
+  view.type = sensor->type;
+  view.read_interval = sensor->read_interval;
+  view.divider = sensor->divider;
+  view.factor = sensor->factor;
+  view.port = sensor->port;
+  view.id = sensor->id;
+  view.ip = sensor->ip;
+  view.group = sensor->group;
+  view.name = sensor->name;
+  view.name_len = 0;
+  view.require_modbus = sensor_type_needs_modbus_addr(sensor->type) ? 1 : 0;
+  view.require_ads_channel = sensor_type_needs_ads_channel(sensor->type) ? 1 : 0;
+  view.type_known = sensor_type_is_known(sensor->type) ? 1 : 0;
+
+  int rc = sensor_validate_config(&view);
+  if (rc != SENSOR_VAL_OK) return rc;
+
+  if (check_duplicate_nr) {
+    auto it = sensorsMap.find(sensor->nr);
+    if (it != sensorsMap.end() && it->second != sensor) {
+      return SENSOR_VAL_ERR_DUPLICATE;
+    }
+  }
+  return SENSOR_VAL_OK;
+}
+
 /**
  * @brief define or insert a sensor from JSON configuration
  *
@@ -822,13 +967,24 @@ int sensor_define(ArduinoJson::JsonVariantConst json, bool save) {
   auto it = sensorsMap.find(nr);
   
   if (is_partial_update) {
-    // Partial update - sensor must exist
+    // Partial update - sensor must exist; reject immutable identity changes
     if (it == sensorsMap.end()) {
       return HTTP_RQT_NOT_RECEIVED;
     }
     
     SensorBase *sensor = it->second;
-    sensor->fromJson(json);
+    // Reject attempts to change nr via payload mismatch (identity field).
+    if (json.containsKey("nr") && (uint)json["nr"] != sensor->nr) {
+      DEBUG_PRINTLN(F("[SENSOR] Rejected partial update: immutable nr change"));
+      return HTTP_RQT_NOT_RECEIVED;
+    }
+
+    sensor->fromConfigJson(json);
+    int vrc = sensor_validate_object(sensor, 0);
+    if (vrc != SENSOR_VAL_OK) {
+      DEBUG_PRINTF("[SENSOR] Validation failed for #%u: %s\n", nr, sensor_validation_strerror(vrc));
+      return HTTP_RQT_NOT_RECEIVED;
+    }
     
     if (save) sensor_save();
     sensor_notify_zigbee(sensor);
@@ -839,24 +995,57 @@ int sensor_define(ArduinoJson::JsonVariantConst json, bool save) {
   
   // Full definition with type
   uint type = json["type"];
-  if (type == 0) return HTTP_RQT_NOT_RECEIVED;
+  if (type == 0 || !sensor_type_is_known(type)) {
+    DEBUG_PRINTF("[SENSOR] Rejected sensor #%u: invalid type %u\n", nr, type);
+    return HTTP_RQT_NOT_RECEIVED;
+  }
   
   if (it != sensorsMap.end()) {
-    // Sensor exists - check if type changed
     SensorBase *old_sensor = it->second;
-    if (old_sensor->type != type) {
-      // DEBUG_PRINTLN(F("sensor_define: type changed, recreating"));
-      delete old_sensor;
-      sensorsMap.erase(it);
-      // Fall through to create new sensor
-    } else {
-      // Same type, update from JSON
-      old_sensor->fromJson(json);
-      
+    if (old_sensor->type == type) {
+      // Same type: apply config in place; roll back identity-critical fields on failure.
+      const uint32_t old_ip = old_sensor->ip;
+      const uint old_port = old_sensor->port;
+      const uint old_id = old_sensor->id;
+      const uint old_ri = old_sensor->read_interval;
+      const int16_t old_div = old_sensor->divider;
+      const int16_t old_fac = old_sensor->factor;
+      char old_name[sizeof(old_sensor->name)];
+      memcpy(old_name, old_sensor->name, sizeof(old_name));
+
+      old_sensor->fromConfigJson(json);
+      old_sensor->nr = nr;
+      old_sensor->type = type;
+
+      int vrc = sensor_validate_object(old_sensor, 0);
+      if (vrc != SENSOR_VAL_OK) {
+        DEBUG_PRINTF("[SENSOR] Validation failed for #%u: %s — restoring prior config\n",
+                     nr, sensor_validation_strerror(vrc));
+        old_sensor->ip = old_ip;
+        old_sensor->port = old_port;
+        old_sensor->id = old_id;
+        old_sensor->read_interval = old_ri;
+        old_sensor->divider = old_div;
+        old_sensor->factor = old_fac;
+        memcpy(old_sensor->name, old_name, sizeof(old_name));
+        return HTTP_RQT_NOT_RECEIVED;
+      }
+
+      const bool driver_changed =
+          (old_ip != old_sensor->ip) || (old_port != old_sensor->port) || (old_id != old_sensor->id);
+      if (driver_changed) {
+        old_sensor->deinit();
+        if (!old_sensor->init()) {
+          DEBUG_PRINTF("[SENSOR] Re-init failed for #%u after driver field change\n", nr);
+          return HTTP_RQT_NOT_RECEIVED;
+        }
+      }
+
       if (save) sensor_save();
       sensor_notify_zigbee(old_sensor);
       return HTTP_RQT_SUCCESS;
     }
+    // Type changed: transactional recreate — do not delete old until replacement is ready
   }
   
   // Gateway-managed Zigbee devices should not be duplicated as bare placeholder
@@ -936,16 +1125,38 @@ int sensor_define(ArduinoJson::JsonVariantConst json, bool save) {
     }
   }
 
-  // Create new sensor
+  // Create replacement first; only then remove/replace any existing map entry.
   boolean ip_based = json.containsKey("ip") && (json["ip"].as<uint32_t>() > 0);
   SensorBase *new_sensor = sensor_make_obj(type, ip_based);
 
   if (!new_sensor) {
+    DEBUG_PRINTF("[SENSOR] Unsupported/failed factory for type %u\n", type);
     return HTTP_RQT_NOT_RECEIVED;
   }
 
-  // Load from JSON
-  new_sensor->fromJson(json);
+  new_sensor->fromConfigJson(json);
+  new_sensor->nr = nr;
+  new_sensor->type = type;
+
+  int vrc = sensor_validate_object(new_sensor, 0);
+  if (vrc != SENSOR_VAL_OK) {
+    DEBUG_PRINTF("[SENSOR] Validation failed for #%u: %s\n", nr, sensor_validation_strerror(vrc));
+    delete new_sensor;
+    return HTTP_RQT_NOT_RECEIVED;
+  }
+
+  if (!new_sensor->init()) {
+    DEBUG_PRINTF("[SENSOR] init() failed for #%u — keeping previous sensor if any\n", nr);
+    new_sensor->deinit();
+    delete new_sensor;
+    return HTTP_RQT_NOT_RECEIVED;
+  }
+
+  if (it != sensorsMap.end()) {
+    SensorBase *old_sensor = it->second;
+    old_sensor->deinit();
+    delete old_sensor;
+  }
 
   sensorsMap[nr] = new_sensor;
   if (save) sensor_save();
@@ -1040,6 +1251,13 @@ static bool sensor_parse_file(const char *fn) {
     if (sensorNr == 0 || sensorType == 0) {
       continue; // Skip invalid sensor entries (type=0 or nr=0)
     }
+
+    if (sensorsMap.find(sensorNr) != sensorsMap.end()) {
+      DEBUG_PRINTF("sensor_load: duplicate sensor nr=%u — skipping to avoid overwrite/leak\n",
+                   sensorNr);
+      continue;
+    }
+
     boolean ip_based = (v["ip"] | 0) != 0;
 
     SensorBase *sensor = sensor_make_obj(sensorType, ip_based);
@@ -1047,7 +1265,30 @@ static bool sensor_parse_file(const char *fn) {
       sensor = new GenericSensor(sensorType);
     }
 
-    sensor->fromJson(v);
+    sensor->fromConfigJson(v);
+
+    SensorConfigView view = {};
+    view.nr = sensor->nr ? sensor->nr : sensorNr;
+    view.type = sensor->type ? sensor->type : sensorType;
+    view.read_interval = sensor->read_interval;
+    view.divider = sensor->divider;
+    view.factor = sensor->factor;
+    view.port = sensor->port;
+    view.id = sensor->id;
+    view.ip = sensor->ip;
+    view.group = sensor->group;
+    view.name = sensor->name;
+    view.require_modbus = sensor_type_needs_modbus_addr(view.type) ? 1 : 0;
+    view.require_ads_channel = sensor_type_needs_ads_channel(view.type) ? 1 : 0;
+    // During load, allow types not compiled into this variant (stored as GenericSensor).
+    view.type_known = (sensor_type_is_known(view.type) || sensor->isGeneric()) ? 1 : 0;
+    int vrc = sensor_validate_config(&view);
+    if (vrc != SENSOR_VAL_OK) {
+      DEBUG_PRINTF("sensor_load: rejecting sensor nr=%u (%s)\n",
+                   sensorNr, sensor_validation_strerror(vrc));
+      delete sensor;
+      continue;
+    }
 
     // If the type is not supported in this firmware variant (e.g. a ZigBee
     // sensor loaded on a Matter build), store the full raw JSON so all
@@ -1191,7 +1432,7 @@ void sensor_save() {
     }
 
     // Always write current base-class values (name, enable, log, etc.).
-    sensor->toJson(obj);
+    sensor->toConfigJson(obj);
     if (doc.overflowed()) ok = false;
     serializeJson(doc, writer);
   }
@@ -1879,7 +2120,10 @@ void read_all_sensors(boolean online) {
   unsigned long pass_start_ms = millis();
   while (current_sensor && current_sensor_it != sensorsMap.end()) {
     //ulong time_since_last = (current_sensor->last_read == 0) ? 99999 : (time - current_sensor->last_read);
-    boolean should_read = (time >= current_sensor->last_read + current_sensor->read_interval || current_sensor->repeat_read);
+    boolean should_read = (current_sensor->last_read == 0) ||
+        timing_elapsed_ge((uint32_t)time, (uint32_t)current_sensor->last_read,
+                          (uint32_t)current_sensor->read_interval) ||
+        current_sensor->repeat_read;
     
     if (should_read) {
       if (!current_sensor->flags.enable || current_sensor->type == SENSOR_TYPE_NONE) {
@@ -1912,16 +2156,17 @@ void read_all_sensors(boolean online) {
           unsigned long push_start_ms = millis();
           push_message(current_sensor);
           DEBUG_PRINTF(F("[SENSOR] push done #%d duration=%lums\n"), current_sensor->nr, millis() - push_start_ms);
-        } else if (result == HTTP_RQT_TIMEOUT) {
-          // delay next read on timeout:
-          current_sensor->last_read = time + max((uint)60, current_sensor->read_interval);
+        } else if (result == HTTP_RQT_TIMEOUT || result == HTTP_RQT_CONNECT_ERR) {
+          // Rollover-safe retry: store failure time adjusted so the normal
+          // (now - last_read) >= read_interval check waits max(60, ri) once —
+          // never pre-add the interval into last_read (that doubled the delay).
+          {
+            uint32_t ri = current_sensor->read_interval;
+            uint32_t retry = timing_retry_delay_seconds(ri);
+            if (ri == 0) ri = retry;
+            current_sensor->last_read = (ulong)((uint32_t)time - ri + retry);
+          }
           current_sensor->repeat_read = 0;
-          // DEBUG_PRINTF("Delayed1: %s\n", current_sensor->name);
-        } else if (result == HTTP_RQT_CONNECT_ERR) {
-          // delay next read on error:
-          current_sensor->last_read = time + max((uint)60, current_sensor->read_interval);
-          current_sensor->repeat_read = 0;
-          // DEBUG_PRINTF("Delayed2: %s\n", current_sensor->name);
         } else if (result == HTTP_RQT_NOT_RECEIVED) {
           // ZigBee sensors manage their own read timing via last_read:
           // the sensor sets last_read when it sends an active read request,
@@ -2204,7 +2449,9 @@ void sensor_update_groups() {
 
   for (auto &kv : sensorsMap) {
     SensorBase *sensor = kv.second;
-    if (time >= sensor->last_read + sensor->read_interval) {
+    if (sensor->last_read == 0 ||
+        timing_elapsed_ge((uint32_t)time, (uint32_t)sensor->last_read,
+                          (uint32_t)sensor->read_interval)) {
       switch (sensor->type) {
         case SENSOR_GROUP_MIN:
         case SENSOR_GROUP_MAX:
