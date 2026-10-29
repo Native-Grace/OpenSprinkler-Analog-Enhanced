@@ -1743,7 +1743,10 @@ void server_home(OTF_PARAMS_DEF)
 #endif
 	bfill.emit_p(PSTR("<!DOCTYPE html><html><head>$F</head><body><script>"), htmlMobileHeader);
 	// send server variables and javascript packets
-	bfill.emit_p(PSTR("var ver=$D,ipas=$D;</script>"),
+	// Shop UI home.js parses the device origin with /https?:\/\/.*?\/.*?\// which
+	// only matches when a "#/" hash path is present; without it the loader dies
+	// after "Loading..." on a blank page. Set the hash before home.js runs.
+	bfill.emit_p(PSTR("var ver=$D,ipas=$D;if(!/#\\//.test(location.href))location.hash='/';</script>"),
 							 OS_FW_VERSION, os.iopts[IOPT_IGNORE_PASSWORD]);
 
 	bfill.emit_p(PSTR("<script src=\"$O/home.js\"></script></body></html>"), SOPT_JAVASCRIPTURL);
